@@ -1,0 +1,116 @@
+{
+    "roamer_ATRAC": {
+        "information": {
+            "authors": "",
+            "name": "ATRAC - Active Traction Control",
+            "value": 0,
+        },
+
+        "slotType": "roamer_mod",
+
+        "variables": [
+            ["name", "type", "unit", "category", "default", "min", "max", "title", "description"],
+
+            // ── Slip Detection ────────────────────────────────────────────────
+            ["$atrac_slipThreshold",        "range", "",    "ATRAC", 0.08, 0.04, 0.20, "Slip Threshold",
+                "Per-wheel slip ratio that triggers brake intervention. Lower = more sensitive.",
+                {"minDis":4,   "maxDis":20}],
+
+            ["$atrac_slipRangeThreshold",   "range", "",    "ATRAC", 0.10, 0.05, 0.25, "Slip Range Threshold",
+                "Inter-wheel slip difference needed to open brake gate. Lower = more differential-aware.",
+                {"minDis":5,   "maxDis":25}],
+
+            // ── Speed Window ──────────────────────────────────────────────────
+            ["$atrac_velocityOffsetThresh", "range", "m/s", "ATRAC", 3,    1,    10,   "Low Speed Threshold",
+                "Speed below which TC remains active near standstill. Lower = active closer to stopped.",
+                {"minDis":1,   "maxDis":10}],
+
+            ["$atrac_maxVelocity",          "range", "m/s", "ATRAC", 15,   5,    30,   "Max Active Speed",
+                "Speed above which ATRAC brake intervention fades out. 15 m/s = 54 km/h.",
+                {"minDis":5,   "maxDis":30}],
+
+            // ── Brake PID ─────────────────────────────────────────────────────
+            ["$atrac_kP",                   "range", "",    "ATRAC", 1.2,  0.5,  3.0,  "Brake kP",
+                "Proportional gain - immediate brake response to slip. Higher = more aggressive.",
+                {"minDis":50,  "maxDis":300}],
+
+            ["$atrac_kI",                   "range", "",    "ATRAC", 0.6,  0.0,  2.0,  "Brake kI",
+                "Integral gain - builds brake pressure over sustained slip. Keep low to avoid windup.",
+                {"minDis":0,   "maxDis":200}],
+
+            // ── Torque Cap ────────────────────────────────────────────────────
+            // torqueFloor is now in WHEEL torque (Nm) after final drive ratio
+            // multiplication. The roamer V8 at idle in low range delivers
+            // roughly 400-600 Nm at the axle. Tune up if ATRAC is too passive
+            // at light throttle, down if it stalls at very low RPM.
+            ["$atrac_torqueFloor",          "range", "Nm",  "ATRAC", 400,  50,   1000, "Torque Floor",
+                "Minimum wheel-level brake authority at idle throttle (Nm). Tune to axle torque at idle in low range.",
+                {"minDis":50,  "maxDis":1000}],
+
+            ["$atrac_safetyMarginCoef",     "range", "",    "ATRAC", 1.05, 1.00, 1.25, "Safety Margin",
+                "Brake authority above torque parity. Higher = more TC bite, increased stall risk at low RPM.",
+                {"minDis":100, "maxDis":125}],
+        ],
+
+        "controller": [
+            ["fileName"],
+            ["drivingDynamics/CMU", {
+                "name": "CMU",
+                "debugSettings": {
+                    "enableDebugMode": false,
+                    "peerIP": "127.0.0.1"
+                }
+            }],
+            ["drivingDynamics/sensors/sensorHub"],
+            ["drivingDynamics/sensors/virtualSensors", {"name": "sensors"}],
+            ["drivingDynamics/sensors/vehicleData",    {"name": "vehicleData"}],
+            ["drivingDynamics/supervisors/components/motorTorqueControl", {
+                "name": "motorTorqueControl"
+            }],
+            ["drivingDynamics/supervisors/components/brakeControl", {
+                "name": "brakeControl"
+            }],
+            ["drivingDynamics/supervisors/tractionControl", {
+                "name": "tractionControl"
+            }],
+            ["drivingDynamics/supervisors/slipProviders/virtualSpeedSlip"],
+            ["drivingDynamics/supervisors/components/atracTorqueCap"],
+        ],
+
+        // ── tractionControl Supervisor ────────────────────────────────────────
+        "tractionControl": {
+            "tractionControlledMotors": ["mainEngine"],
+            "velocityOffsetThreshold": "$atrac_velocityOffsetThresh",
+        },
+
+        // ── motorTorqueControl ────────────────────────────────────────────────
+        // Disabled for TC. ATRAC does not cut throttle.
+        "motorTorqueControl": {
+            "useForTractionControl": false,
+            "useForYawControl": false,
+        },
+
+        // ── brakeControl ──────────────────────────────────────────────────────
+        "brakeControl": {
+            "useForTractionControl": true,
+            "useForYawControl": false,
+            "useForABSControl": false,
+            "tractionControl": {
+                "wheelGroupSettings": [
+                    ["motorName",   "slipThreshold",        "slipRangeThreshold",        "maxVelocity",        "kP",        "kI",        "kD", "integralInCoef", "integralOutCoef"],
+                    ["mainEngine",  "$atrac_slipThreshold", "$atrac_slipRangeThreshold", "$atrac_maxVelocity", "$atrac_kP", "$atrac_kI", 0,    12,               3                ],
+                ],
+            },
+        },
+
+        // ── atracTorqueCap ────────────────────────────────────────────────────
+        // torqueFloor is in wheel-level Nm (post final drive ratio).
+        // torqueCapSmoothingRate and gearRatioCoef are calibration constants,
+        // not exposed as tune variables.
+        "atracTorqueCap": {
+            "torqueCapSmoothingRate": 15,
+            "torqueFloor":            "$atrac_torqueFloor",
+            "safetyMarginCoef":       "$atrac_safetyMarginCoef",
+        },
+    },
+}
