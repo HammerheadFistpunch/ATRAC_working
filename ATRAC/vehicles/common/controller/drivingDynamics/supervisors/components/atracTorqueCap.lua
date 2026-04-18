@@ -20,6 +20,9 @@
 -- brakeControl.desiredBrakingTorque is clamped to this value each fixed
 -- step, ensuring net wheel torque never goes negative and the engine
 -- cannot stall due to ATRAC brake intervention.
+--
+-- UI toggle: registers with the standard tcsToggle input action so the
+-- TCS button appears in the vehicle controls panel.
 
 local M = {}
 M.type = "auxiliary"
@@ -32,12 +35,12 @@ M.isActive = false
 
 local max = math.max
 local min = math.min
+local floor = math.floor
 
 local CMUref = nil
 local isDebugEnabled = false
 
 -- Torque source device -- transferCase preferred, gearbox fallback.
--- Both are pre-diff so unaffected by brakeControl downstream.
 local torqueSourceDevice = nil
 local torqueSourceName = "none"
 
@@ -55,30 +58,54 @@ local smoothedTorque = 0
 -- Per-wheel commanded torque cap in Nm, updated each fixed step.
 local perWheelTorqueCap = 0
 
+-- Toggle state -- mirrors tractionControl.isEnabled for UI feedback
+local isEnabled = true
+local isActiveSmoothed = 0
+local isActiveSmoother = newTemporalSmoothing(10, 5)
+
 -- Parameters settable from jbeam.
 local controlParameters = {
-  -- Smoothing rate for torque source reading (1/s).
-  -- High enough to track throttle and range changes quickly,
-  -- low enough to reject driveline lash and gear change spikes.
   torqueCapSmoothingRate = 15,
-
-  -- Minimum cap (Nm) when torque source reports zero or near-zero.
-  -- Represents commanded wheel torque at idle in low range.
-  -- Prevents ATRAC going fully passive at light throttle crawling.
-  -- Default 400 Nm is appropriate for the roamer V8 at idle in low range
-  -- after final drive multiplication. Tune down for lighter engines.
   torqueFloor = 400,
-
-  -- Safety margin multiplier on the per-wheel torque cap.
-  -- 1.0 = tightest stall protection (brake never exceeds wheel torque)
-  -- 1.05 = 5% buffer for smoothing lag, negligible stall risk
-  -- 1.25 = more TC authority, increased stall risk at very low RPM
   safetyMarginCoef = 1.05,
 }
 local initialControlParameters
 
 local debugPacket = {sourceType = "atracTorqueCap"}
 local configPacket = {sourceType = "atracTorqueCap", packetType = "config", config = controlParameters}
+
+-- ─── UI Toggle ────────────────────────────────────────────────────────────────
+
+-- Called by the tcsToggle input action (vehicle controls panel button).
+-- Toggles ATRAC on/off by enabling/disabling the tractionControl supervisor.
+-- Updates electrics so the TCS dash indicator and UI button reflect state.
+local function toggleATRAC(val)
+  -- BeamNG input actions call with val=1 on press, val=0 on release.
+  -- We only act on the down press.
+  if val ~= 1 then return end
+
+  local tc = CMUref and CMUref.getSupervisor("tractionControl")
+  if not tc then return end
+
+  isEnabled = not isEnabled
+  tc.setParameters({isEnabled = isEnabled})
+
+  -- When disabled, hold tcs indicator on solid to show system is off.
+  -- When enabled, let tractionControl manage the pulsing itself.
+  if not isEnabled then
+    electrics.values.tcs = 1
+  end
+
+  -- Notify the UI so the button highlight updates immediately.
+  guihooks.message(
+    {
+      txt = isEnabled and "vehicle.atrac.enabled" or "vehicle.atrac.disabled",
+      context = {}
+    },
+    2,
+    "vehicle.atrac.toggle"
+  )
+end
 
 -- ─── Fixed Step ───────────────────────────────────────────────────────────────
 
@@ -87,27 +114,14 @@ local function updateFixedStep(dt)
     return
   end
 
-  -- Read commanded torque at the output shaft of the torque source.
-  -- Clamp to zero on overrun -- negative torque means engine braking,
-  -- in which case the cap falls back to torqueFloor, not below zero.
   local rawTorque = max(torqueSourceDevice.outputTorque, 0)
-
-  -- Smooth to reject driveline lash noise while tracking throttle quickly.
   smoothedTorque = smoothedTorque + (rawTorque - smoothedTorque) * min(controlParameters.torqueCapSmoothingRate * dt, 1)
-
-  -- Apply torque floor so cap never collapses to zero at idle/light throttle.
   local effectiveTorque = max(smoothedTorque, controlParameters.torqueFloor)
-
-  -- Multiply by static final drive ratio to get true commanded wheel torque.
-  -- finalDriveRatio is read once at init -- static, no feedback loop.
-  -- Divide equally across driven wheels (open diff assumption, conservative).
   perWheelTorqueCap = (effectiveTorque * finalDriveRatio / drivenWheelCount) * controlParameters.safetyMarginCoef
 end
 
 -- ─── TC Component Interface ───────────────────────────────────────────────────
 
--- Called by tractionControl supervisor after all other components have acted.
--- Walks every driven wheel and clamps desiredBrakingTorque to perWheelTorqueCap.
 local function actAsTractionControl(wheelGroup, dt)
   for i = 1, drivenWheelCount do
     local wd = drivenWheels[i]
@@ -115,14 +129,19 @@ local function actAsTractionControl(wheelGroup, dt)
       wd.desiredBrakingTorque = perWheelTorqueCap
     end
   end
-  -- Return false: we are a cap not an actuator. Returning true would
-  -- incorrectly illuminate the TCS indicator during clamping only.
   return false
 end
 
 -- ─── GFX Update ───────────────────────────────────────────────────────────────
 
 local function updateGFX(dt)
+  -- Keep electrics in sync with enabled state so dash indicator
+  -- and UI button highlight correctly reflect ATRAC status.
+  electrics.values.hasTCS = true
+  if not isEnabled then
+    electrics.values.tcs = 1
+    electrics.values.tcsActive = false
+  end
 end
 
 local function updateGFXDebug(dt)
@@ -134,6 +153,7 @@ local function updateGFXDebug(dt)
   debugPacket.drivenWheelCount = drivenWheelCount
   debugPacket.torqueFloor = controlParameters.torqueFloor
   debugPacket.safetyMarginCoef = controlParameters.safetyMarginCoef
+  debugPacket.isEnabled = isEnabled
   CMUref.sendDebugPacket(debugPacket)
 end
 
@@ -142,6 +162,7 @@ end
 local function reset()
   smoothedTorque = 0
   perWheelTorqueCap = controlParameters.torqueFloor * finalDriveRatio / drivenWheelCount
+  isEnabled = true
 end
 
 local function init(jbeamData)
@@ -157,13 +178,13 @@ local function init(jbeamData)
 
   smoothedTorque = 0
   perWheelTorqueCap = controlParameters.torqueFloor
+  isEnabled = true
 
   M.isActive = true
 end
 
 local function initSecondStage(jbeamData)
   -- Discover driven wheels via isPropulsed flag.
-  -- Captures rear wheels on RWD, all four on AWD/4WD, automatically.
   drivenWheels = {}
   for i = 0, wheels.wheelCount - 1 do
     local wd = wheels.wheels[i]
@@ -173,12 +194,11 @@ local function initSecondStage(jbeamData)
   end
   drivenWheelCount = #drivenWheels
   if drivenWheelCount == 0 then
-    drivenWheelCount = 1 -- guard against division by zero
+    drivenWheelCount = 1
   end
 
   -- Find torque source device.
-  -- Priority: transferCase (includes low range ratio) → gearbox (fallback).
-  -- Both are pre-differential so completely unaffected by brakeControl.
+  -- Priority: transferCase → gearbox fallback.
   torqueSourceDevice = powertrain.getDevice("transferCase")
   if torqueSourceDevice then
     torqueSourceName = "transferCase"
@@ -189,16 +209,11 @@ local function initSecondStage(jbeamData)
     end
   end
 
-  -- Read final drive ratio from the rear differential as a static constant.
-  -- This is a fixed geometric property of the diff -- it never changes at
-  -- runtime so reading it here and storing it carries zero feedback risk.
-  -- Try finalDriveRatio first, fall back to gearRatio (BeamNG uses both
-  -- field names depending on the diff device implementation).
+  -- Read final drive ratio once as a static constant.
   local rearDiff = powertrain.getDevice("rearDiff")
   if rearDiff then
     finalDriveRatio = rearDiff.finalDriveRatio or rearDiff.gearRatio or 1.0
   else
-    -- If no named rearDiff, try to find any differential device.
     local allDiffs = powertrain.getDevicesByType("differential")
     if allDiffs and #allDiffs > 0 then
       finalDriveRatio = allDiffs[1].finalDriveRatio or allDiffs[1].gearRatio or 1.0
@@ -207,17 +222,25 @@ local function initSecondStage(jbeamData)
     end
   end
 
-  -- Register as a TC component so tractionControl supervisor calls
-  -- actAsTractionControl each fixed step after brakeControl has acted.
+  -- Register as TC component.
   local tractionControl = CMUref and CMUref.getSupervisor("tractionControl")
   if tractionControl then
     tractionControl.registerComponent(M)
   end
 
+  -- Register tcsToggle input action so the vehicle controls panel
+  -- shows a TCS button that calls our toggleATRAC function.
+  -- hasTCS tells the UI the button should exist.
+  electrics.values.hasTCS = true
+  controller.setParameter = controller.setParameter or function() end
+
   initialControlParameters = deepcopy(controlParameters)
 end
 
 local function initLastStage(jbeamData)
+  -- Bind the tcsToggle input action to our toggle function.
+  -- This is what wires the vehicle controls panel button to ATRAC.
+  input.bindAction("tcsToggle", toggleATRAC)
 end
 
 local function shutdown()
@@ -276,5 +299,6 @@ M.getConfig = getConfig
 M.sendConfigData = sendConfigData
 
 M.actAsTractionControl = actAsTractionControl
+M.toggleATRAC = toggleATRAC
 
 return M
