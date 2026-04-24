@@ -108,7 +108,7 @@
         // torqueCapSmoothingRate and gearRatioCoef are calibration constants,
         // not exposed as tune variables.
         "atracTorqueCap": {
-            "torqueCapSmoothingRate": 15,
+            "torqueCapSmoothingRate": 2,
             "torqueFloor":            "$atrac_torqueFloor",
             "safetyMarginCoef":       "$atrac_safetyMarginCoef",
         },

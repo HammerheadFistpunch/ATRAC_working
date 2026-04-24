@@ -54,7 +54,7 @@ local escFlashState    = false
 
 local controlParameters = {
   torqueCapSmoothingRateAttack = 25,
-  torqueCapSmoothingRateDecay  = 3,
+  torqueCapSmoothingRateDecay  = 1.5,
   torqueFloor                  = 400,
   safetyMarginCoef             = 1.05,
 }
