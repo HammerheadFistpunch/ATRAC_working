@@ -1,0 +1,49 @@
+BeamNG Roamer ATRAC Mod — Session Summary
+What we're building
+A custom ATRAC (Active Traction Control) system for a BeamNG mod vehicle called the Roamer, implemented as a controller component that slots into BeamNG's tractionControl supervisor chain.
+Files involved
+
+atracTorqueCap.lua — the main controller
+roamer_atrac.jbeam — companion jbeam wiring parameters and UI variables
+atrac_active.ogg — looping sound played during intervention (converted from a GX460 crawl control recording)
+
+
+Architecture (important context)
+BeamNG's TC chain runs in this order each physics tick:
+
+virtualSpeedSlip — computes wheelGroup.wheels[j].slip (0–0.5 ratio) for all driven wheels
+brakeControl (order 30) — PID-based, writes wd.desiredBrakingTorque
+atracTorqueCap (order 40) — our component, overwrites desiredBrakingTorque with bang-bang commands
+
+Key fields available in actAsTractionControl(wheelGroup, dt):
+
+wheelGroup.wheels[j].slip — already computed, ready to use
+wheelGroup.wheels[j].wd.desiredBrakingTorque — writable
+wheelGroup.wheels[j].wd.brakeTorque — wheel's physical max brake torque
+wheelGroup.slipRange — max minus min slip across the group
+
+
+What the current Lua does
+actAsTractionControl — per-wheel state machine:
+
+IDLE: slip below threshold, don't touch desiredBrakingTorque
+ATTACK: slip ≥ slipThreshold → immediately write wd.brakeTorque * attackFactor, no ramp
+RELEASE1: slip just cleared → drop to wd.brakeTorque * releaseHoldFactor, hold for releaseHoldTime
+RELEASE2: linear bleed from releaseHoldFactor to 0 over releaseBleedTime
+Re-spin during any release phase → jumps straight back to ATTACK
+
+updateFixedStep — torque cap (stall protection ceiling):
+
+Attack: instant (smoothedTorque = rawTorque, no lerp)
+Decay: linear at torqueDecayRate Nm/s when not intervening
+Frozen while interventionHoldTimer > 0
+perWheelTorqueCap clips the bang-bang brake command as a last resort
+
+updateGFX — drives ESC warning light (flash = active, solid = disabled) and starts/stops the looping sound
+
+Current default parameters
+ParameterDefaultNotesslipThreshold0.08shared with brakeControlattackFactor0.85fraction of wd.brakeTorquereleaseHoldFactor0.25fraction during phase 1releaseHoldTime120 msreleaseBleedTime250 mstorqueFloor5500 Nmtransfer-case-output unitssafetyMarginCoef1.4cap rarely limitingtorqueDecayRate8000 Nm/sinterventionHoldTime400 msfreeze cap after slip
+
+Where things stand
+All three files are in their final state and ready to test in-game. The most likely first tuning levers after testing: lower attackFactor if it's too violent, increase releaseHoldTime if wheels re-spin immediately after release.
+Sound path expected at: art/sound/vehicles/roamer/sounds/atrac_active.ogg
