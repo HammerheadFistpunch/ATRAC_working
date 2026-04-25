@@ -26,7 +26,7 @@
                 {"minDis":1,   "maxDis":10}],
 
             ["$atrac_maxVelocity",          "range", "m/s", "ATRAC", 15,   5,    30,   "Max Active Speed",
-                "Speed above which ATRAC brake intervention fades out. 15 m/s = 54 km/h.",
+                "Speed above which ATRAC brake intervention fades out. 15 m/s ≈ 54 km/h.",
                 {"minDis":5,   "maxDis":30}],
 
             // ── Brake PID ─────────────────────────────────────────────────────
@@ -39,17 +39,31 @@
                 {"minDis":0,   "maxDis":200}],
 
             // ── Torque Cap ────────────────────────────────────────────────────
-            // torqueFloor is now in WHEEL torque (Nm) after final drive ratio
-            // multiplication. The roamer V8 at idle in low range delivers
-            // roughly 400-600 Nm at the axle. Tune up if ATRAC is too passive
-            // at light throttle, down if it stalls at very low RPM.
-            ["$atrac_torqueFloor",          "range", "Nm",  "ATRAC", 600,  50,   2000, "Torque Floor",
-                "Minimum wheel-level brake authority at idle throttle (Nm). Tune to axle torque at idle in low range.",
-                {"minDis":50,  "maxDis":2000}],
+            // torqueFloor is in transfer-case-output Nm.
+            // transferCase.outputTorque is post-transmission and post-low-range,
+            // so it already reflects the full crawl ratio multiplication.
+            // Example: ~200 Nm engine idle × ~28:1 crawl ratio = ~5600 Nm here.
+            // Tune up if ATRAC is too passive at light throttle.
+            // Tune down if it stalls at very low RPM.
+            ["$atrac_torqueFloor",          "range", "Nm",  "ATRAC", 5500, 1000, 10000, "Torque Floor",
+                "Minimum brake authority at idle throttle (Nm at transfer case output). ~engineIdleTorque × crawlRatio.",
+                {"minDis":1000, "maxDis":10000}],
 
             ["$atrac_safetyMarginCoef",     "range", "",    "ATRAC", 1.05, 1.00, 1.25, "Safety Margin",
                 "Brake authority above torque parity. Higher = more TC bite, increased stall risk at low RPM.",
                 {"minDis":100, "maxDis":125}],
+
+            // ── Clamp Behaviour ───────────────────────────────────────────────
+            // Decay rate controls how fast brake authority bleeds off after
+            // the wheel clears. Hold time freezes the cap for a fixed window
+            // after each slip event, covering wheel-hop gaps between bounces.
+            ["$atrac_torqueCapSmoothingRateDecay", "range", "",  "ATRAC", 1.5, 0.1, 8.0, "Cap Decay Rate",
+                "How fast brake authority bleeds off once a slip event fully clears. Lower = stickier clamp.",
+                {"minDis":10,  "maxDis":800}],
+
+            ["$atrac_interventionHoldTime", "range", "ms",  "ATRAC", 400,  50,   1000, "Intervention Hold",
+                "Milliseconds the torque cap stays frozen after the last slip event. Prevents premature release between wheel hops.",
+                {"minDis":50,  "maxDis":1000}],
         ],
 
         "controller": [
@@ -84,7 +98,7 @@
         },
 
         // ── motorTorqueControl ────────────────────────────────────────────────
-        // Disabled for TC. ATRAC does not cut throttle.
+        // Disabled: ATRAC does not cut throttle.
         "motorTorqueControl": {
             "useForTractionControl": false,
             "useForYawControl": false,
@@ -104,13 +118,16 @@
         },
 
         // ── atracTorqueCap ────────────────────────────────────────────────────
-        // torqueFloor is in wheel-level Nm (post final drive ratio).
-        // torqueCapSmoothingRate and gearRatioCoef are calibration constants,
-        // not exposed as tune variables.
+        // torqueFloor: transfer-case-output Nm (see variable comment above).
+        // Final drive ratio assumed 4.0 (ASSUMED_FINAL_DRIVE constant in Lua).
+        // Attack rate is a calibration constant, not exposed as a tune variable.
+        // Legacy torqueCapSmoothingRate key removed: it collapsed the asymmetric
+        // rates and caused the grab-release oscillation.
         "atracTorqueCap": {
-            "torqueCapSmoothingRate": 2,
-            "torqueFloor":            "$atrac_torqueFloor",
-            "safetyMarginCoef":       "$atrac_safetyMarginCoef",
+            "torqueFloor":                 "$atrac_torqueFloor",
+            "safetyMarginCoef":            "$atrac_safetyMarginCoef",
+            "torqueCapSmoothingRateDecay": "$atrac_torqueCapSmoothingRateDecay",
+            "interventionHoldTime":        "$atrac_interventionHoldTime",
         },
     },
 }
