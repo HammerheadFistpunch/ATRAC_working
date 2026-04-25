@@ -3,36 +3,51 @@
 -- file, You can obtain one at http://beamng.com/bCDDL-1.1.txt
 
 -- ATRAC Torque Cap Controller
--- Runs as the final component in the tractionControl chain.
+-- Runs as the final component in the tractionControl chain (order 40),
+-- AFTER brakeControl (order 30) has already written desiredBrakingTorque
+-- via its PID. We overwrite that value with our own bang-bang command.
 --
--- Torque read point: transferCase.outputTorque (falls back to gearbox)
---   - Post-gearbox ratio        ✓
---   - Post-low-range ratio      ✓
---   - Pre-differential          ✓  (no feedback loop from brakeControl)
+-- SLIP SOURCE: wheelGroup.wheels[j].slip is populated by virtualSpeedSlip
+-- before actAsTractionControl is called. We read it directly; we do not
+-- re-compute slip ourselves.
 --
--- Final drive ratio: assumed 4.0 (ASSUMED_FINAL_DRIVE constant).
--- The rearDiff device is unreliable at init; hardcoding avoids silent
--- mis-reads. Update the constant if axle gearing changes. The read
--- from rearDiff is kept for debug logging only.
+-- CONTROL MODEL: per-wheel state machine.
+--   IDLE     : slip below threshold. Do not touch desiredBrakingTorque.
+--   ATTACK   : slip at or above threshold. Immediately write
+--              wd.brakeTorque * attackFactor to desiredBrakingTorque.
+--              Hard, no ramp. Stays here while slip >= slipThreshold.
+--   RELEASE1 : slip just dropped below threshold. Fast drop to
+--              wd.brakeTorque * releaseHoldFactor for releaseHoldTime
+--              seconds. Prevents immediate re-spin.
+--   RELEASE2 : linear bleed from releaseHoldFactor down to 0 over
+--              releaseBleedTime seconds. Smooth handoff back to idle.
 --
--- SMOOTHING: Asymmetric -- fast attack, intervention-gated decay.
---   Attack  : always runs, tracks rising drivetrain torque immediately.
---   Decay   : blocked while isIntervening == true OR within
---             interventionHoldTime seconds of the last intervention.
---             This prevents the cap from bleeding down while the wheel
---             is still slipping, eliminating the grab-release oscillation.
+-- TORQUE CAP (updateFixedStep):
+--   Still acts as a stall-protection ceiling on desiredBrakingTorque.
+--   Attack: instant -- smoothedTorque = rawTorque, no lerp lag.
+--   Decay:  linear at torqueDecayRate Nm/s when not intervening.
+--           Frozen while interventionHoldTimer > 0.
+--   safetyMarginCoef is 1.4 so the cap sits well above normal drivetrain
+--   output and is rarely the limiting factor. It only steps in if the
+--   bang-bang command would genuinely stall the engine.
+--
+-- TORQUE CAP UNITS:
+--   torqueSourceDevice.outputTorque is post-transmission, post-low-range,
+--   pre-differential (transfer case output).
+--   perWheelTorqueCap = smoothedTorque * ASSUMED_FINAL_DRIVE
+--                       / drivenWheelCount * safetyMarginCoef
+--   This gives a per-wheel ceiling in the same Nm units as
+--   wd.desiredBrakingTorque.
 --
 -- LOW-RANGE GATE: actAsTractionControl is a no-op unless the transfer
--- case is in low range.
+--   case is in low range.
 --
--- AIRBORNE DETECTION: wheels with contactDepth <= 0 have no ground
--- contact. The torque cap is bypassed for those wheels, allowing
--- brakeControl full authority. They still count as intervening so the
--- hold timer stays armed.
+-- AIRBORNE DETECTION: wheels with contactDepth <= 0.001 are skipped
+--   (brakeControl retains authority) but still arm the intervention hold.
 --
 -- UI TOGGLE: The esc controller calls applyConfig on ALL controllers
--- when the user cycles the button. We check the config name to toggle
--- isEnabled.
+--   when the user cycles the button. We check the config name to toggle
+--   isEnabled.
 
 local M = {}
 M.type = "auxiliary"
@@ -40,27 +55,31 @@ M.defaultOrder = 75
 M.componentOrderTractionControl = 40
 M.isActive = false
 
-local max = math.max
-local min = math.min
+local max  = math.max
+local min  = math.min
 
--- Assumed final drive ratio (ring gear to wheel).
--- transferCase.outputTorque is already post-transmission and post-low-range,
--- so this is the only remaining multiplication to reach wheel torque.
--- For 4 driven wheels: ASSUMED_FINAL_DRIVE / drivenWheelCount = 4/4 = 1,
--- so perWheelTorqueCap ≈ smoothedTorque × safetyMarginCoef at that config.
--- The constant is kept explicit so the math stays correct if wheel count
--- ever differs from 4.
+-- Assumed final drive ratio (transfer case output to wheel).
+-- Update if axle gearing changes. rearDiff read is kept for debug only.
 local ASSUMED_FINAL_DRIVE = 4.0
 
-local CMUref = nil
+-- Sound: looping clip played while ATRAC is actively intervening.
+-- Place the file at:  vehicles/<your_vehicle>/sounds/atrac_active.ogg
+local ATRAC_SOUND_PATH = "art/sound/vehicles/roamer/sounds/atrac_active.ogg"
+local soundSource      = nil
+local soundPlaying     = false
+
+local CMUref         = nil
 local isDebugEnabled = false
 
 local torqueSourceDevice = nil
 local torqueSourceName   = "none"
 local transferCaseDevice = nil
-local finalDriveRatio    = 1.0   -- read from rearDiff for debug logging only
-local drivenWheels       = {}
-local drivenWheelCount   = 0
+local finalDriveRatio    = 1.0   -- debug log only; math uses ASSUMED_FINAL_DRIVE
+local drivenWheelCount   = 0     -- used for torque cap math
+
+-- Per-wheel bang-bang state. Keyed by wd.name. Populated in initSecondStage.
+-- Fields: phase ("idle"|"attack"|"release1"|"release2"), releaseTimer (s)
+local wheelStates = {}
 
 local smoothedTorque        = 0
 local perWheelTorqueCap     = 0
@@ -73,18 +92,31 @@ local ESC_FLASH_PERIOD = 0.15
 local escFlashState    = false
 
 local controlParameters = {
-  torqueCapSmoothingRateAttack = 25,
-  torqueCapSmoothingRateDecay  = 1.5,
-  torqueFloor                  = 5500,
-  safetyMarginCoef             = 1.05,
-  interventionHoldTime         = 0.4,
+  -- Slip sense
+  slipThreshold     = 0.08,   -- slip ratio that triggers attack (0-0.5 scale from virtualSpeedSlip)
+
+  -- Bang-bang brake factors (fraction of wd.brakeTorque)
+  attackFactor      = 0.85,   -- applied immediately on slip onset; hard step
+  releaseHoldFactor = 0.25,   -- reduced pressure during release phase 1
+
+  -- Release timing (stored in seconds; jbeam supplies milliseconds)
+  releaseHoldTime   = 0.12,   -- seconds at releaseHoldFactor before bleeding
+  releaseBleedTime  = 0.25,   -- seconds to linearly ramp from holdFactor to 0
+
+  -- Torque cap (stall protection backstop)
+  torqueFloor       = 5500,   -- minimum cap in transfer-case-output Nm
+  safetyMarginCoef  = 1.4,    -- cap = smoothedTorque * this; 1.4 keeps cap above normal output
+  torqueDecayRate   = 8000,   -- linear decay of cap in Nm/s when not intervening
+
+  -- Hold timer: freeze cap decay this long after last intervention
+  interventionHoldTime = 0.4,
 }
 local initialControlParameters
 
 local debugPacket  = {sourceType = "atracTorqueCap"}
 local configPacket = {sourceType = "atracTorqueCap", packetType = "config", config = controlParameters}
 
--- Low-Range Detection
+-- ─── Low-Range Detection ──────────────────────────────────────────────────────
 
 local function isInLowRange()
   if not transferCaseDevice then return true end
@@ -103,7 +135,7 @@ local function isInLowRange()
   return true
 end
 
--- Internal enable/disable
+-- ─── Enable / Disable ─────────────────────────────────────────────────────────
 
 local function setEnabled(val)
   isEnabled = val
@@ -111,9 +143,6 @@ local function setEnabled(val)
   if tc then tc.setParameters({isEnabled = isEnabled}) end
 end
 
--- applyConfig: called by the esc controller on button cycle.
--- configName is the string key from the configurations block
--- ("ATRAC On" or "ATRAC Off").
 local function applyConfig(configName, configData)
   if type(configName) == "string" then
     local name = configName:lower()
@@ -125,12 +154,13 @@ local function applyConfig(configName, configData)
   end
 end
 
--- Fixed Step
+-- ─── Torque Cap Fixed Step ────────────────────────────────────────────────────
+-- Maintains perWheelTorqueCap as a stall-protection ceiling.
+-- Runs each physics tick before actAsTractionControl.
 
 local function updateFixedStep(dt)
-  -- Update the hold timer from the PREVIOUS frame's intervention state,
-  -- then reset the flag for this frame. actAsTractionControl will re-arm
-  -- it if it clamps any wheel this frame.
+  -- Arm / count down the hold timer from the PREVIOUS frame's state,
+  -- then clear isIntervening for this frame (actAsTractionControl re-arms it).
   if isIntervening then
     interventionHoldTimer = controlParameters.interventionHoldTime
   elseif interventionHoldTimer > 0 then
@@ -142,40 +172,47 @@ local function updateFixedStep(dt)
 
   local rawTorque = max(torqueSourceDevice.outputTorque or 0, 0)
 
-  -- Attack: always runs at full rate, tracks rising torque immediately.
-  -- Decay: only runs when the hold timer has fully expired.
-  --        rate = 0 while timer is active → cap stays frozen.
-  local rate
+  -- Attack: instant. No lerp. Cap tracks rising torque with zero lag.
+  -- Decay:  linear at torqueDecayRate Nm/s, only when hold timer is clear.
+  -- Hold:   frozen while interventionHoldTimer > 0 and torque is falling.
   if rawTorque >= smoothedTorque then
-    rate = controlParameters.torqueCapSmoothingRateAttack
+    smoothedTorque = rawTorque
   elseif interventionHoldTimer <= 0 then
-    rate = controlParameters.torqueCapSmoothingRateDecay
-  else
-    rate = 0
+    smoothedTorque = max(
+      smoothedTorque - controlParameters.torqueDecayRate * dt,
+      controlParameters.torqueFloor
+    )
   end
+  -- else: hold, no change
 
-  smoothedTorque = smoothedTorque + (rawTorque - smoothedTorque) * min(rate * dt, 1)
-
-  -- torqueFloor is in transfer-case-output Nm (same units as outputTorque).
-  -- Multiply by ASSUMED_FINAL_DRIVE and divide by wheel count to reach
-  -- per-wheel brake authority.
   local effectiveTorque = max(smoothedTorque, controlParameters.torqueFloor)
   perWheelTorqueCap = (effectiveTorque * ASSUMED_FINAL_DRIVE / drivenWheelCount)
                       * controlParameters.safetyMarginCoef
 end
 
--- TC Component Interface
+-- ─── TC Component Interface ───────────────────────────────────────────────────
+-- Called by tractionControl supervisor after virtualSpeedSlip has populated
+-- wheelGroup.wheels[j].slip for all wheels in this group.
+-- We overwrite desiredBrakingTorque directly; we do not clip the upstream PID.
 
 local function actAsTractionControl(wheelGroup, dt)
   if not isInLowRange() then return false end
 
-  for i = 1, drivenWheelCount do
-    local wd = drivenWheels[i]
+  local didAct = false
 
-    -- Airborne detection.
-    -- contactDepth > 0 means the tyre is deformed against a surface.
-    -- If the field is absent fall back to downForce, and if that is also
-    -- absent treat the wheel as grounded (fail safe).
+  for i = 1, wheelGroup.wheelCount do
+    local wheelData = wheelGroup.wheels[i]
+    local wd        = wheelData.wd
+    local slip      = wheelData.slip
+    local state     = wheelStates[wd.name]
+
+    -- Lazily create state for any wheel not seen at init.
+    if not state then
+      state = {phase = "idle", releaseTimer = 0}
+      wheelStates[wd.name] = state
+    end
+
+    -- Airborne: no ground contact. Clear any active brake state, arm hold timer.
     local isAirborne = false
     if wd.contactDepth ~= nil then
       isAirborne = wd.contactDepth <= 0.001
@@ -184,24 +221,82 @@ local function actAsTractionControl(wheelGroup, dt)
     end
 
     if isAirborne then
-      -- No ground contact: no traction possible regardless of torque.
-      -- Skip the torque cap entirely so brakeControl can apply full authority.
-      -- Still count as intervening to keep the hold timer armed.
+      state.phase        = "idle"
+      state.releaseTimer = 0
+      isIntervening      = true
+      -- do not touch desiredBrakingTorque; brakeControl retains authority
+
+    elseif slip >= controlParameters.slipThreshold then
+      -- ── ATTACK ──────────────────────────────────────────────────────────────
+      -- Wheel is slipping. Hard brake step, no ramp.
+      -- Re-enters attack from any release phase: if the wheel re-spins during
+      -- bleed we go immediately back to full brake.
+      state.phase        = "attack"
+      state.releaseTimer = 0
+      wd.desiredBrakingTorque = min(
+        wd.brakeTorque * controlParameters.attackFactor,
+        perWheelTorqueCap
+      )
       isIntervening = true
-    elseif wd.desiredBrakingTorque and wd.desiredBrakingTorque > perWheelTorqueCap then
-      wd.desiredBrakingTorque = perWheelTorqueCap
+      didAct        = true
+
+    elseif state.phase == "attack" then
+      -- ── RELEASE PHASE 1 (fast drop) ─────────────────────────────────────────
+      -- Slip just cleared. Drop to holdFactor immediately; hold for
+      -- releaseHoldTime to prevent instant re-spin.
+      state.phase        = "release1"
+      state.releaseTimer = controlParameters.releaseHoldTime
+      wd.desiredBrakingTorque = min(
+        wd.brakeTorque * controlParameters.releaseHoldFactor,
+        perWheelTorqueCap
+      )
       isIntervening = true
+      didAct        = true
+
+    elseif state.phase == "release1" then
+      -- ── RELEASE PHASE 1 (hold) ───────────────────────────────────────────────
+      state.releaseTimer = state.releaseTimer - dt
+      if state.releaseTimer <= 0 then
+        state.phase        = "release2"
+        state.releaseTimer = controlParameters.releaseBleedTime
+      end
+      wd.desiredBrakingTorque = min(
+        wd.brakeTorque * controlParameters.releaseHoldFactor,
+        perWheelTorqueCap
+      )
+      isIntervening = true
+      didAct        = true
+
+    elseif state.phase == "release2" then
+      -- ── RELEASE PHASE 2 (linear bleed) ──────────────────────────────────────
+      -- Ramp from releaseHoldFactor linearly to 0 over releaseBleedTime.
+      state.releaseTimer = state.releaseTimer - dt
+      if state.releaseTimer <= 0 then
+        state.phase        = "idle"
+        state.releaseTimer = 0
+        -- Back to idle: stop writing desiredBrakingTorque.
+      else
+        local bleedFraction = state.releaseTimer / controlParameters.releaseBleedTime
+        wd.desiredBrakingTorque = min(
+          wd.brakeTorque * controlParameters.releaseHoldFactor * bleedFraction,
+          perWheelTorqueCap
+        )
+        isIntervening = true
+        didAct        = true
+      end
+
     end
+    -- phase == "idle": do nothing. brakeControl's PID value stands.
   end
-  return false
+
+  return didAct
 end
 
--- GFX Update
--- Overwrites electrics.values.esc each frame with our indicator logic.
--- We run after the esc controller so our value wins.
---   OFF     = enabled, idle
---   FLASH   = enabled, actively intervening
---   SOLID   = disabled (system off warning)
+-- ─── GFX Update ───────────────────────────────────────────────────────────────
+-- Overwrites electrics.values.esc each frame. Runs after esc controller.
+--   SOLID 1 = system disabled (warning)
+--   FLASH   = active intervention
+--   OFF 0   = enabled, idle
 
 local function updateGFX(dt)
   if not isEnabled then
@@ -209,10 +304,18 @@ local function updateGFX(dt)
     electrics.values.escActive = false
     escFlashTimer = 0
     escFlashState = false
+    if soundPlaying and soundSource then
+      soundSource:stop()
+      soundPlaying = false
+    end
     return
   end
 
   if isIntervening then
+    if not soundPlaying and soundSource then
+      soundSource:play()
+      soundPlaying = true
+    end
     escFlashTimer = escFlashTimer + dt
     if escFlashTimer >= ESC_FLASH_PERIOD then
       escFlashTimer = escFlashTimer - ESC_FLASH_PERIOD
@@ -221,6 +324,10 @@ local function updateGFX(dt)
     electrics.values.esc       = escFlashState and 1 or 0
     electrics.values.escActive = true
   else
+    if soundPlaying and interventionHoldTimer <= 0 and soundSource then
+      soundSource:stop()
+      soundPlaying = false
+    end
     escFlashTimer = 0
     escFlashState = false
     electrics.values.esc       = 0
@@ -232,45 +339,66 @@ local function updateGFXDebug(dt)
   updateGFX(dt)
   debugPacket.torqueSourceName      = torqueSourceName
   debugPacket.assumedFinalDrive     = ASSUMED_FINAL_DRIVE
-  debugPacket.readFinalDriveRatio   = finalDriveRatio        -- logged, not used in math
+  debugPacket.readFinalDriveRatio   = finalDriveRatio
   debugPacket.smoothedTorque        = smoothedTorque
   debugPacket.perWheelTorqueCap     = perWheelTorqueCap
   debugPacket.drivenWheelCount      = drivenWheelCount
   debugPacket.torqueFloor           = controlParameters.torqueFloor
   debugPacket.safetyMarginCoef      = controlParameters.safetyMarginCoef
+  debugPacket.torqueDecayRate       = controlParameters.torqueDecayRate
   debugPacket.interventionHoldTimer = interventionHoldTimer
   debugPacket.isEnabled             = isEnabled
   debugPacket.isIntervening         = isIntervening
   debugPacket.inLowRange            = isInLowRange()
   debugPacket.rawTorque             = torqueSourceDevice and max(torqueSourceDevice.outputTorque, 0) or 0
+  debugPacket.wheelStates           = {}
+  for name, state in pairs(wheelStates) do
+    debugPacket.wheelStates[name] = {phase = state.phase, releaseTimer = state.releaseTimer}
+  end
   CMUref.sendDebugPacket(debugPacket)
 end
 
--- Lifecycle
+-- ─── Lifecycle ────────────────────────────────────────────────────────────────
+
+local function resetWheelStates()
+  for _, state in pairs(wheelStates) do
+    state.phase        = "idle"
+    state.releaseTimer = 0
+  end
+end
 
 local function reset()
   smoothedTorque        = 0
-  perWheelTorqueCap     = controlParameters.torqueFloor * ASSUMED_FINAL_DRIVE / math.max(drivenWheelCount, 1)
+  perWheelTorqueCap     = controlParameters.torqueFloor * ASSUMED_FINAL_DRIVE
+                          / math.max(drivenWheelCount, 1)
   isEnabled             = true
   isIntervening         = false
   interventionHoldTimer = 0
   escFlashTimer         = 0
   escFlashState         = false
+  resetWheelStates()
+  if soundSource and soundPlaying then
+    soundSource:stop()
+  end
+  soundPlaying = false
 end
 
 local function init(jbeamData)
-  -- Support separate attack / decay keys only.
-  -- The legacy torqueCapSmoothingRate key is intentionally NOT supported:
-  -- it collapsed the asymmetric rates into one value and was the root cause
-  -- of the grab-release oscillation.
-  if jbeamData.torqueCapSmoothingRateAttack ~= nil then
-    controlParameters.torqueCapSmoothingRateAttack = jbeamData.torqueCapSmoothingRateAttack
-  end
-  if jbeamData.torqueCapSmoothingRateDecay  ~= nil then
-    controlParameters.torqueCapSmoothingRateDecay  = jbeamData.torqueCapSmoothingRateDecay
-  end
-  if jbeamData.torqueFloor          ~= nil then controlParameters.torqueFloor          = jbeamData.torqueFloor          end
-  if jbeamData.safetyMarginCoef     ~= nil then controlParameters.safetyMarginCoef     = jbeamData.safetyMarginCoef     end
+  -- Slip sense
+  if jbeamData.slipThreshold      ~= nil then controlParameters.slipThreshold      = jbeamData.slipThreshold      end
+
+  -- Bang-bang factors
+  if jbeamData.attackFactor       ~= nil then controlParameters.attackFactor       = jbeamData.attackFactor       end
+  if jbeamData.releaseHoldFactor  ~= nil then controlParameters.releaseHoldFactor  = jbeamData.releaseHoldFactor  end
+
+  -- Release timing (jbeam in ms)
+  if jbeamData.releaseHoldTime    ~= nil then controlParameters.releaseHoldTime    = jbeamData.releaseHoldTime    / 1000 end
+  if jbeamData.releaseBleedTime   ~= nil then controlParameters.releaseBleedTime   = jbeamData.releaseBleedTime   / 1000 end
+
+  -- Torque cap
+  if jbeamData.torqueFloor        ~= nil then controlParameters.torqueFloor        = jbeamData.torqueFloor        end
+  if jbeamData.safetyMarginCoef   ~= nil then controlParameters.safetyMarginCoef   = jbeamData.safetyMarginCoef   end
+  if jbeamData.torqueDecayRate    ~= nil then controlParameters.torqueDecayRate     = jbeamData.torqueDecayRate    end
   if jbeamData.interventionHoldTime ~= nil then controlParameters.interventionHoldTime = jbeamData.interventionHoldTime / 1000 end
 
   smoothedTorque        = 0
@@ -285,14 +413,17 @@ local function init(jbeamData)
 end
 
 local function initSecondStage(jbeamData)
-  drivenWheels = {}
+  -- Count driven wheels and pre-populate wheel states.
+  local drivenCount = 0
+  wheelStates = {}
   for i = 0, wheels.wheelCount - 1 do
     local wd = wheels.wheels[i]
     if wd and wd.isPropulsed then
-      table.insert(drivenWheels, wd)
+      drivenCount = drivenCount + 1
+      wheelStates[wd.name] = {phase = "idle", releaseTimer = 0}
     end
   end
-  drivenWheelCount = math.max(#drivenWheels, 1)
+  drivenWheelCount = math.max(drivenCount, 1)
 
   torqueSourceDevice = powertrain.getDevice("transferCase")
   if torqueSourceDevice then
@@ -305,7 +436,6 @@ local function initSecondStage(jbeamData)
   transferCaseDevice = powertrain.getDevice("transferCase")
 
   -- Read finalDriveRatio for debug logging only.
-  -- All torque cap math uses ASSUMED_FINAL_DRIVE instead.
   local rearDiff = powertrain.getDevice("rearDiff")
   if rearDiff then
     finalDriveRatio = rearDiff.finalDriveRatio or rearDiff.gearRatio or 1.0
@@ -325,6 +455,9 @@ local function initSecondStage(jbeamData)
 
   controller.setParameter = controller.setParameter or function() end
   initialControlParameters = deepcopy(controlParameters)
+
+  soundSource  = obj:createSFXSource(ATRAC_SOUND_PATH, "AudioDefaultLoop3D")
+  soundPlaying = false
 end
 
 local function initLastStage(jbeamData)
@@ -334,9 +467,14 @@ local function shutdown()
   M.isActive        = false
   M.updateGFX       = nil
   M.updateFixedStep = nil
+  if soundSource then
+    soundSource:stop()
+    soundSource = nil
+  end
+  soundPlaying = false
 end
 
--- Debug & Config Interface
+-- ─── Debug & Config Interface ─────────────────────────────────────────────────
 
 local function setDebugMode(debugEnabled)
   isDebugEnabled = debugEnabled
@@ -348,10 +486,14 @@ local function registerCMU(cmu)
 end
 
 local function setParameters(parameters)
-  CMUref.applyParameter(controlParameters, initialControlParameters, parameters, "torqueCapSmoothingRateAttack")
-  CMUref.applyParameter(controlParameters, initialControlParameters, parameters, "torqueCapSmoothingRateDecay")
+  CMUref.applyParameter(controlParameters, initialControlParameters, parameters, "slipThreshold")
+  CMUref.applyParameter(controlParameters, initialControlParameters, parameters, "attackFactor")
+  CMUref.applyParameter(controlParameters, initialControlParameters, parameters, "releaseHoldFactor")
+  CMUref.applyParameter(controlParameters, initialControlParameters, parameters, "releaseHoldTime")
+  CMUref.applyParameter(controlParameters, initialControlParameters, parameters, "releaseBleedTime")
   CMUref.applyParameter(controlParameters, initialControlParameters, parameters, "torqueFloor")
   CMUref.applyParameter(controlParameters, initialControlParameters, parameters, "safetyMarginCoef")
+  CMUref.applyParameter(controlParameters, initialControlParameters, parameters, "torqueDecayRate")
   CMUref.applyParameter(controlParameters, initialControlParameters, parameters, "interventionHoldTime")
 end
 
@@ -362,22 +504,22 @@ local function sendConfigData()
   CMUref.sendDebugPacket(configPacket)
 end
 
--- Exports
+-- ─── Exports ──────────────────────────────────────────────────────────────────
 
-M.init            = init
-M.initSecondStage = initSecondStage
-M.initLastStage   = initLastStage
-M.reset           = reset
-M.updateGFX       = updateGFX
-M.updateFixedStep = updateFixedStep
-M.registerCMU     = registerCMU
-M.setDebugMode    = setDebugMode
-M.shutdown        = shutdown
-M.setParameters   = setParameters
-M.setConfig       = setConfig
-M.getConfig       = getConfig
-M.sendConfigData  = sendConfigData
+M.init                 = init
+M.initSecondStage      = initSecondStage
+M.initLastStage        = initLastStage
+M.reset                = reset
+M.updateGFX            = updateGFX
+M.updateFixedStep      = updateFixedStep
+M.registerCMU          = registerCMU
+M.setDebugMode         = setDebugMode
+M.shutdown             = shutdown
+M.setParameters        = setParameters
+M.setConfig            = setConfig
+M.getConfig            = getConfig
+M.sendConfigData       = sendConfigData
 M.actAsTractionControl = actAsTractionControl
-M.applyConfig     = applyConfig
+M.applyConfig          = applyConfig
 
 return M

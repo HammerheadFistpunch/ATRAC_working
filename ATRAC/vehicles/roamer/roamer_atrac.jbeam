@@ -12,12 +12,14 @@
             ["name", "type", "unit", "category", "default", "min", "max", "title", "description"],
 
             // ── Slip Detection ────────────────────────────────────────────────
+            // slipThreshold is shared: brakeControl uses it as its PID trigger,
+            // atracTorqueCap uses it as the bang-bang attack trigger.
             ["$atrac_slipThreshold",        "range", "",    "ATRAC", 0.08, 0.04, 0.20, "Slip Threshold",
                 "Per-wheel slip ratio that triggers brake intervention. Lower = more sensitive.",
                 {"minDis":4,   "maxDis":20}],
 
             ["$atrac_slipRangeThreshold",   "range", "",    "ATRAC", 0.10, 0.05, 0.25, "Slip Range Threshold",
-                "Inter-wheel slip difference needed to open brake gate. Lower = more differential-aware.",
+                "Inter-wheel slip difference needed to open brakeControl gate. Lower = more differential-aware.",
                 {"minDis":5,   "maxDis":25}],
 
             // ── Speed Window ──────────────────────────────────────────────────
@@ -29,40 +31,63 @@
                 "Speed above which ATRAC brake intervention fades out. 15 m/s ≈ 54 km/h.",
                 {"minDis":5,   "maxDis":30}],
 
-            // ── Brake PID ─────────────────────────────────────────────────────
+            // ── brakeControl PID (upstream, runs before atracTorqueCap) ───────
             ["$atrac_kP",                   "range", "",    "ATRAC", 1.2,  0.5,  3.0,  "Brake kP",
-                "Proportional gain - immediate brake response to slip. Higher = more aggressive.",
+                "Proportional gain for brakeControl upstream PID.",
                 {"minDis":50,  "maxDis":300}],
 
             ["$atrac_kI",                   "range", "",    "ATRAC", 0.6,  0.0,  2.0,  "Brake kI",
-                "Integral gain - builds brake pressure over sustained slip. Keep low to avoid windup.",
+                "Integral gain for brakeControl upstream PID. Keep low to avoid windup.",
                 {"minDis":0,   "maxDis":200}],
+
+            // ── Bang-Bang Attack ──────────────────────────────────────────────
+            // attackFactor is the fraction of wd.brakeTorque applied immediately
+            // when slip is detected. 0.85 = hard step to 85% of wheel brake capacity.
+            // Torque cap still clips this if it would stall the engine.
+            ["$atrac_attackFactor",         "range", "",    "ATRAC", 0.85, 0.40, 1.00, "Attack Factor",
+                "Fraction of wheel brake torque applied immediately on slip onset. Higher = harder bite.",
+                {"minDis":40,  "maxDis":100}],
+
+            // ── Release Behaviour ─────────────────────────────────────────────
+            // Phase 1: fast drop to releaseHoldFactor, held for releaseHoldTime.
+            // Phase 2: linear bleed from holdFactor to zero over releaseBleedTime.
+            ["$atrac_releaseHoldFactor",    "range", "",    "ATRAC", 0.25, 0.05, 0.60, "Release Hold Factor",
+                "Fraction of wheel brake torque held briefly after slip clears. Prevents immediate re-spin.",
+                {"minDis":5,   "maxDis":60}],
+
+            ["$atrac_releaseHoldTime",      "range", "ms",  "ATRAC", 120,  30,   400,  "Release Hold Time",
+                "Milliseconds to hold at releaseHoldFactor before bleeding to zero.",
+                {"minDis":30,  "maxDis":400}],
+
+            ["$atrac_releaseBleedTime",     "range", "ms",  "ATRAC", 250,  50,   600,  "Release Bleed Time",
+                "Milliseconds to linearly ramp brake pressure from holdFactor down to zero.",
+                {"minDis":50,  "maxDis":600}],
 
             // ── Torque Cap ────────────────────────────────────────────────────
             // torqueFloor is in transfer-case-output Nm.
             // transferCase.outputTorque is post-transmission and post-low-range,
             // so it already reflects the full crawl ratio multiplication.
-            // Example: ~200 Nm engine idle × ~28:1 crawl ratio = ~5600 Nm here.
-            // Tune up if ATRAC is too passive at light throttle.
-            // Tune down if it stalls at very low RPM.
+            // Example: ~200 Nm engine idle × ~28:1 crawl ratio ≈ 5600 Nm here.
             ["$atrac_torqueFloor",          "range", "Nm",  "ATRAC", 5500, 1000, 10000, "Torque Floor",
-                "Minimum brake authority at idle throttle (Nm at transfer case output). ~engineIdleTorque × crawlRatio.",
+                "Minimum cap at idle throttle (Nm at transfer case output). ~engineIdleTorque × crawlRatio.",
                 {"minDis":1000, "maxDis":10000}],
 
-            ["$atrac_safetyMarginCoef",     "range", "",    "ATRAC", 1.05, 1.00, 1.25, "Safety Margin",
-                "Brake authority above torque parity. Higher = more TC bite, increased stall risk at low RPM.",
-                {"minDis":100, "maxDis":125}],
+            // safetyMarginCoef at 1.4: cap sits 40% above smoothed drivetrain
+            // torque, so it is rarely the active constraint. Only clips the
+            // bang-bang command if it would genuinely stall the engine.
+            ["$atrac_safetyMarginCoef",     "range", "",    "ATRAC", 1.40, 1.00, 2.00, "Safety Margin",
+                "Cap = smoothedTorque × this. 1.4 keeps cap permissive; increase only if stalling occurs.",
+                {"minDis":100, "maxDis":200}],
 
-            // ── Clamp Behaviour ───────────────────────────────────────────────
-            // Decay rate controls how fast brake authority bleeds off after
-            // the wheel clears. Hold time freezes the cap for a fixed window
-            // after each slip event, covering wheel-hop gaps between bounces.
-            ["$atrac_torqueCapSmoothingRateDecay", "range", "",  "ATRAC", 1.5, 0.1, 8.0, "Cap Decay Rate",
-                "How fast brake authority bleeds off once a slip event fully clears. Lower = stickier clamp.",
-                {"minDis":10,  "maxDis":800}],
+            // torqueDecayRate: how fast the cap bleeds back to torqueFloor
+            // after a slip event clears. 8000 Nm/s recovers from a typical
+            // torque spike in well under a second.
+            ["$atrac_torqueDecayRate",      "range", "Nm/s","ATRAC", 8000, 1000, 20000, "Cap Decay Rate",
+                "Nm/s at which the torque cap bleeds back to torqueFloor after slip clears. Higher = faster recovery.",
+                {"minDis":1000, "maxDis":20000}],
 
             ["$atrac_interventionHoldTime", "range", "ms",  "ATRAC", 400,  50,   1000, "Intervention Hold",
-                "Milliseconds the torque cap stays frozen after the last slip event. Prevents premature release between wheel hops.",
+                "Milliseconds the torque cap stays frozen after the last slip event. Covers wheel-hop gaps.",
                 {"minDis":50,  "maxDis":1000}],
         ],
 
@@ -105,6 +130,9 @@
         },
 
         // ── brakeControl ──────────────────────────────────────────────────────
+        // Still runs (order 30) and writes desiredBrakingTorque via PID.
+        // atracTorqueCap (order 40) overwrites it on any wheel that exceeds
+        // slipThreshold. brakeControl's value stands on idle wheels.
         "brakeControl": {
             "useForTractionControl": true,
             "useForYawControl": false,
@@ -118,16 +146,21 @@
         },
 
         // ── atracTorqueCap ────────────────────────────────────────────────────
-        // torqueFloor: transfer-case-output Nm (see variable comment above).
-        // Final drive ratio assumed 4.0 (ASSUMED_FINAL_DRIVE constant in Lua).
-        // Attack rate is a calibration constant, not exposed as a tune variable.
-        // Legacy torqueCapSmoothingRate key removed: it collapsed the asymmetric
-        // rates and caused the grab-release oscillation.
+        // slipThreshold shared with brakeControl above.
+        // Release times supplied in ms; Lua divides by 1000.
+        // torqueFloor in transfer-case-output Nm (see variable comment above).
+        // ASSUMED_FINAL_DRIVE (4.0) is a constant in Lua; update it there if
+        // axle gearing changes.
         "atracTorqueCap": {
-            "torqueFloor":                 "$atrac_torqueFloor",
-            "safetyMarginCoef":            "$atrac_safetyMarginCoef",
-            "torqueCapSmoothingRateDecay": "$atrac_torqueCapSmoothingRateDecay",
-            "interventionHoldTime":        "$atrac_interventionHoldTime",
+            "slipThreshold":        "$atrac_slipThreshold",
+            "attackFactor":         "$atrac_attackFactor",
+            "releaseHoldFactor":    "$atrac_releaseHoldFactor",
+            "releaseHoldTime":      "$atrac_releaseHoldTime",
+            "releaseBleedTime":     "$atrac_releaseBleedTime",
+            "torqueFloor":          "$atrac_torqueFloor",
+            "safetyMarginCoef":     "$atrac_safetyMarginCoef",
+            "torqueDecayRate":      "$atrac_torqueDecayRate",
+            "interventionHoldTime": "$atrac_interventionHoldTime",
         },
     },
 }
