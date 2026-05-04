@@ -1,0 +1,11 @@
+Here's a summary of every change made and why:
+attackFactor — accumulator overpressure (both files)
+Default lifted from 0.85 to 1.80, jbeam max raised from 1.00 to 3.00. The multiplier can now exceed wd.brakeTorque to model the accumulator's hydraulic pressure exceeding what the pedal circuit can generate. The perWheelTorqueCap backstop is untouched — engine stall protection still applies.
+Attack → Hold gate (lua)
+Previously the code transitioned out of attack on a single frame where slip < threshold. Now it requires both: a slipClearDwell timer (default 50ms — rules out momentary dips) AND avgDrivenWheelSpeed >= forwardProgressThreshold (default 0.3 m/s — confirms the vehicle is actually climbing, not just un-spinning). Until both pass, the attack pressure holds with solenoids sealed.
+Airborne pressure freeze (lua)
+Removed the state.phase = "idle" reset on airborne. Instead, if the wheel was already intervening, it writes frozenTorque — the last pressure value — to desiredBrakingTorque. Phase and timers are preserved. On re-contact the wheel resumes exactly where it was. Idle wheels while airborne still leave brakeControl alone.
+frozenTorque tracking
+Every time the state machine writes desiredBrakingTorque it also saves the value to state.frozenTorque. This is what the airborne freeze reads, and it decays naturally to zero when the wheel finally reaches idle.
+New jbeam variables
+$atrac_slipClearDwell (ms) and $atrac_fwdProgressThresh (m/s) wired through to the atracTorqueCap data block, init(), and setParameters().
